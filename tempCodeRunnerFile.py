@@ -1,92 +1,95 @@
-import nest_asyncio
-import uvicorn
-import redis
-import hashlib
-from fastapi import FastAPI, Request, HTTPException, Depends
-from starlette.middleware.base import BaseHTTPMiddleware
-from user_agents import parse
+import requests
+import random
+import time
+import numpy as np
+from joblib import load
+import pandas as pd
 
-# Enable nested asyncio for Colab
-nest_asyncio.apply()
+# Load the trained model
+model = load('random_forest_ddos.pkl')
+BASE_URL = "http://localhost:8000"
 
-# Initialize FastAPI app
-app = FastAPI()
+# Function to generate a random IP address
+def random_ip():
+    return ".".join(str(random.randint(1, 255)) for _ in range(4))
 
-# Connect to Redis (Colab doesn't support Redis locally, use Redis Cloud if needed)
-redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+# Generate traffic data (ensure it matches the model’s expected input format)
+def generate_traffic(is_attack=False):
+    return {
+        "packet_size": random.randint(1400, 1500) if is_attack else random.randint(64, 1500),
+        "packet_rate": random.randint(9000, 10000) if is_attack else random.randint(1, 1000),
+        "source_ip": random_ip(),
+        "destination_ip": "192.168.1.1"
+    }
 
-# Security Settings
-MAX_FAILED_ATTEMPTS = 5  # Max login failures before blocking
-BLOCK_TIME = 300  # Block time in seconds (5 minutes)
-ANOMALY_THRESHOLD = 10  # Requests per second threshold
-FINGERPRINT_EXPIRY = 3600  # Expiry time for device fingerprinting
+# Predict whether the traffic is a DDoS attack
+def predict_attack(traffic):
+    # Convert IPs to numerical format (if required by the model)
+    traffic["source_ip"] = int("".join(traffic["source_ip"].split(".")))
+    traffic["destination_ip"] = int("".join(traffic["destination_ip"].split(".")))
 
-# Middleware for Threat Detection
-class ThreatDetectionMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        client_ip = request.client.host
-        user_agent = request.headers.get("User-Agent", "")
-        parsed_ua = parse(user_agent)
-        device_fingerprint = hashlib.sha256(f"{parsed_ua.os} {parsed_ua.browser}".encode()).hexdigest()
+    df = pd.DataFrame([traffic])  # Convert dict to DataFrame
+    prediction = model.predict(df)  # Predict using the trained model
+    return prediction
 
-        # Rate Limiting - Prevent excessive requests
-        request_count_key = f"requests:{client_ip}"
-        request_count = redis_client.incr(request_count_key)
-        redis_client.expire(request_count_key, 1)  # Reset every second
+# Function to send a login request
+def send_login(payload):
+    headers = {
+        "X-Forwarded-For": random_ip(),
+        "User-Agent": "Security-Tester/1.0"
+    }
+    try:
+        return requests.post(
+            f"{BASE_URL}/login/",
+            data=payload,
+            headers=headers,
+            timeout=2
+        )
+    except Exception as e:
+        print(f"Request failed: {str(e)}")
+        return None
 
-        if request_count > ANOMALY_THRESHOLD:
-            redis_client.setex(f"blocked:{client_ip}", BLOCK_TIME, "1")
-            raise HTTPException(status_code=429, detail="Too many requests detected. IP blocked.")
+# Run the security test scenario
+def test_scenario():
+    credentials = [
+        {"username": "admin", "password": "password"},
+        {"username": "invalid", "password": "wrong"}
+    ]
 
-        # Check if IP is already blocked
-        if redis_client.exists(f"blocked:{client_ip}"):
-            raise HTTPException(status_code=403, detail="Your IP is blocked due to multiple failed attempts.")
+    for i in range(1, 51):
+        is_attack = i % 5 == 0  # Every 5th request simulates an attack
+        traffic = generate_traffic(is_attack)
+        ddos_prediction = predict_attack(traffic)
+        creds = random.choice(credentials)
 
-        # Track device fingerprinting
-        fingerprint_key = f"fingerprint:{device_fingerprint}"
-        redis_client.sadd(fingerprint_key, client_ip)
-        redis_client.expire(fingerprint_key, FINGERPRINT_EXPIRY)
+        headers = {  # Define headers inside the loop
+            "X-Forwarded-For": random_ip(),
+            "User-Agent": "Security-Tester/1.0"
+        }
 
-        response = await call_next(request)
-        return response
+        response = send_login(creds)
 
-# Add middleware
-app.add_middleware(ThreatDetectionMiddleware)
+        print(f"\nRequest {i}:")
+        print(f"IP: {headers['X-Forwarded-For']}")
+        print(f"Predicted DDoS: {'Yes' if ddos_prediction else 'No'}")
+        print(f"Credentials: {creds['username']}:{creds['password']}")
 
-# Login Endpoint
-@app.post("/login/")
-async def login(username: str, password: str, request: Request):
-    client_ip = request.client.host
-    correct_username = "admin"
-    correct_password = "password"
+        if response:
+            print(f"Status: {response.status_code}")
+            if response.status_code == 200:
+                print("Login Successful")
+            elif response.status_code == 401:
+                remaining = response.headers.get('X-Remaining-Attempts', 'Unknown')
+                print(f"Remaining Attempts: {remaining}")
+            elif response.status_code == 403:
+                block_time = response.headers.get('X-Block-Time-Remaining', 0)
+                print(f"IP Blocked - Time Remaining: {block_time}s")
 
-    if username == correct_username and password == correct_password:
-        redis_client.delete(f"failed_attempts:{client_ip}")  # Reset failed attempts
-        return {"message": "Login successful"}
+        time.sleep(random.uniform(0.2, 1.5))  # Random delay between requests
 
-    # Track failed login attempts
-    failed_attempts_key = f"failed_attempts:{client_ip}"
-    failed_attempts = redis_client.incr(failed_attempts_key)
-    redis_client.expire(failed_attempts_key, BLOCK_TIME)
-
-    if failed_attempts >= MAX_FAILED_ATTEMPTS:
-        redis_client.setex(f"blocked:{client_ip}", BLOCK_TIME, "1")
-        raise HTTPException(status_code=403, detail="Too many failed attempts. IP blocked!")
-
-    raise HTTPException(status_code=401, detail="Invalid credentials")
-
-# Root Endpoint
-@app.get("/")
-async def root():
-    return {"message": "Threat Detection API is running!"}
-
-# Expose API using ngrok
-# public_url = ngrok.connect(8000).public_url
-# print(f"Public URL: {public_url}")
-
-# # Run FastAPI server
-# uvicorn.run(app, host="0.0.0.0", port=8000)
-
-if __name__ == '__main__':
-    print("Starting Threat Detection API on http://localhost:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# Main execution
+if __name__ == "__main__":
+    print("Starting Security Test Suite")
+    print(f"Model Version: {model.__class__.__name__} v1.0")
+    test_scenario()
+    print("\nTest Complete!")
